@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
@@ -71,27 +71,48 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
             # Store original file info
             original_filename = file.filename
             original_file_type = "csv" if file.filename.endswith('.csv') else "excel"
+            encoding_used = "utf-8"  # Default encoding
             
             # Convert to pandas dataframe based on file type
             if file.filename.endswith('.csv'):
-                df = pd.read_csv(io.BytesIO(contents))
+                # Try reading with different encodings if UTF-8 fails
+                try:
+                    df = pd.read_csv(io.BytesIO(contents))
+                except UnicodeDecodeError:
+                    # Try with different encodings
+                    encodings = ['latin-1', 'iso-8859-1', 'windows-1252', 'cp1252']
+                    for encoding in encodings:
+                        try:
+                            df = pd.read_csv(io.BytesIO(contents), encoding=encoding)
+                            encoding_used = encoding
+                            break
+                        except Exception:
+                            continue
+                    else:
+                        raise HTTPException(status_code=400, 
+                            detail="Unable to decode CSV file. Please try saving it with UTF-8 encoding.")
             else:  # Excel file
-                excel_df = pd.read_excel(io.BytesIO(contents))
-                
-                # Convert Excel DataFrame to CSV format (in memory)
-                csv_buffer = io.StringIO()
-                excel_df.to_csv(csv_buffer, index=False)
-                csv_buffer.seek(0)
-                
-                # Read back the CSV data
-                df = pd.read_csv(csv_buffer)
+                try:
+                    excel_df = pd.read_excel(io.BytesIO(contents))
+                    
+                    # Convert Excel DataFrame to CSV format (in memory)
+                    csv_buffer = io.StringIO()
+                    excel_df.to_csv(csv_buffer, index=False)
+                    csv_buffer.seek(0)
+                    
+                    # Read back the CSV data
+                    df = pd.read_csv(csv_buffer)
+                except Exception as excel_error:
+                    raise HTTPException(status_code=400, 
+                        detail=f"Error processing Excel file: {str(excel_error)}")
             
             # Store the dataframe and file info with the session ID
             uploaded_df[session_id] = df
             uploaded_file_info[session_id] = {
                 "original_filename": original_filename,
                 "original_type": original_file_type,
-                "converted_to_csv": original_file_type == "excel"
+                "converted_to_csv": original_file_type == "excel",
+                "encoding": encoding_used
             }
             
             # Get column information
@@ -105,6 +126,8 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
             conversion_message = ""
             if original_file_type == "excel":
                 conversion_message = " Excel file was converted to CSV format for processing."
+            elif encoding_used != "utf-8":
+                conversion_message = f" File was read using {encoding_used} encoding."
             
             # Return sanitized data using JSONResponse with the custom encoder
             response_data = {
@@ -113,6 +136,7 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
                 "num_rows_total": len(df),
                 "first_10_rows": sample_data_dict,
                 "converted_to_csv": original_file_type == "excel",
+                "encoding_used": encoding_used,
                 "message": f"File uploaded successfully.{conversion_message} You can now ask questions about your data."
             }
             
@@ -165,7 +189,7 @@ async def ask_question(
         "converted_to_csv": file_info.get("converted_to_csv", False)
     }
     
-    # Construct prompt for Gemini
+    # Construct initial prompt for Gemini
     prompt = f"""
     I have a pandas DataFrame with the following structure:
     
@@ -263,16 +287,164 @@ async def ask_question(
             return JSONResponse(content=response_data, media_type="application/json")
             
         except Exception as e:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": f"Error executing the generated code: {str(e)}",
-                    "code": code
+            # When execution error occurs, send error back to Gemini to fix it
+            error_str = str(e)
+            fix_prompt = f"""
+            You are an expert pandas developer tasked with fixing broken data analysis code.
+
+            Question from user: {question}
+
+            DataFrame structure:
+            Columns: {df_info['columns']}
+
+            First few rows of data:
+            {df.head(5).fillna('NaN').to_string()}
+
+            The following code was generated but produced an error:
+            ```python
+            {code}
+            ```
+
+            Error message: "{error_str}"
+
+            Your task: Fix this code to correctly answer the user's question.
+            Focus on addressing the specific error while ensuring the code properly handles the data structure.
+            Examine the column names carefully and make sure they match the actual DataFrame.
+            Return ONLY the corrected Python code without any explanations or markdown formatting.
+            """
+            
+            try:
+                # Generate fixed code
+                fix_response = model.generate_content(fix_prompt, generation_config={
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                })
+                
+                fixed_text = fix_response.text
+                
+                # Extract code from the fixed response
+                fixed_code_match = re.search(code_pattern, fixed_text, re.DOTALL)
+                
+                if fixed_code_match:
+                    fixed_code = fixed_code_match.group(1)
+                else:
+                    # If no code block is found, try to extract code directly
+                    fixed_code = fixed_text.strip()
+                
+                # Validate the fixed code
+                if not validate_code(fixed_code):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "Generated code contains potentially unsafe operations.",
+                            "original_error": error_str,
+                            "original_code": code,
+                            "fixed_code": fixed_code
+                        }
+                    )
+                
+                # Try executing the fixed code
+                local_vars = {"df": df.copy()}
+                exec(fixed_code, {"pd": pd, "np": np}, local_vars)
+                
+                # Get the result from the fixed code
+                result = None
+                for var_name, var_value in local_vars.items():
+                    if var_name != "df" and isinstance(var_value, (pd.DataFrame, pd.Series)):
+                        result = var_value
+                
+                # If no result variable was found, use the modified df
+                if result is None and "df" in local_vars:
+                    result = local_vars["df"]
+                    
+                # Convert result to JSON-serializable format
+                result_json = None
+                if isinstance(result, pd.DataFrame):
+                    result_limited = result.head(50).replace({np.nan: None})
+                    result_json = sanitize_for_json(result_limited.to_dict(orient='records'))
+                    result_type = "dataframe"
+                elif isinstance(result, pd.Series):
+                    result_limited = result.head(50).replace({np.nan: None})
+                    result_json = sanitize_for_json(result_limited.to_dict())
+                    result_type = "series"
+                else:
+                    try:
+                        result_json = sanitize_for_json(result)
+                    except (TypeError, OverflowError):
+                        result_json = str(result)
+                    result_type = type(result).__name__
+                
+                # Return the fixed code and result
+                response_data = {
+                    "code": fixed_code,
+                    "result": result_json,
+                    "result_type": result_type,
+                    "file_info": {
+                        "original_filename": file_info.get("original_filename", "unknown"),
+                        "converted_from_excel": file_info.get("converted_to_csv", False)
+                    },
+                    "error_fixed": True,
+                    "original_error": error_str
                 }
-            )
+                
+                return JSONResponse(content=response_data, media_type="application/json")
+                
+            except Exception as fix_error:
+                # If fixing also fails, return both the original error and the fixing error
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": f"Original error: {error_str}\nError fixing code: {str(fix_error)}",
+                        "original_code": code,
+                        "fixing_attempt_failed": True
+                    }
+                )
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating or executing code: {str(e)}")
+    
+@app.post("/summarize")
+async def summarize_data(request: Request):
+    try:
+        # Parse the JSON body from the request
+        data = await request.json()
+        
+        # Extract user question and data from the request
+        user_question = data.get("question", "")
+        input_data = data.get("data", {})
+        
+        # Handle empty data
+        if not input_data:
+            raise HTTPException(status_code=400, detail="No data provided for summarization")
+            
+        # Convert data to string representation for the model
+        data_str = json.dumps(input_data, cls=NpEncoder, indent=2)
+        
+        # Get Gemini client
+        model = get_genai_client()
+        
+        # Create a combined prompt without using system role
+        prompt = f"""You are a data analysis assistant. Provide a concise summary of the data and actionable insights. Focus on key trends, outliers, and any important information.
+
+Question: {user_question}
+
+Data:
+{data_str}
+
+Please analyze this data and provide insights related to the question."""
+        
+        # Call the Gemini model with the combined prompt
+        response = model.generate_content(prompt)
+        
+        # Return the summary
+        return {"summary": response.text}
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during summarization: {str(e)}")
 
 @app.get("/")
 async def root():
