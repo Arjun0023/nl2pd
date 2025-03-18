@@ -56,6 +56,18 @@ def get_genai_client():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
 
+def get_genai_client_thinking_model():
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable not set")
+    
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-thinking-exp-01-21')
+        return model
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
+
 # Helper function to sanitize data before JSON serialization
 def sanitize_for_json(obj):
     """Convert data to JSON-safe format using the custom encoder"""
@@ -423,7 +435,7 @@ async def summarize_data(request: Request):
         data_str = json.dumps(input_data, cls=NpEncoder, indent=2)
         
         # Get Gemini client
-        model = get_genai_client()
+        model = get_genai_client_thinking_model()
         
         # Create a combined prompt without using system role
         prompt = f"""You are a data analysis assistant. Provide a concise summary of the data and actionable insights. Focus on key trends, outliers, and any important information.
