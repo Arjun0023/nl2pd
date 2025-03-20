@@ -11,6 +11,9 @@ from typing import Dict, Optional
 import ast
 import google.generativeai as genai
 import json
+from summary_prompt import SUMMARY_PROMPT
+from pandas_prompt import PANDAS_PROMPT
+from codefix_prompt import FIX_CODE_PROMPT
 
 app = FastAPI(title="Data Analysis API")
 
@@ -56,14 +59,14 @@ def get_genai_client():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
 
-def get_genai_client_thinking_model():
+def get_genai_client_thinkingmodel():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable not set")
     
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-thinking-exp-01-21')
+        model = genai.GenerativeModel('gemini-2.0-flash')
         return model
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
@@ -182,6 +185,7 @@ def validate_code(code: str) -> bool:
 async def ask_question(
     question: str = Form(...), 
     session_id: str = Form(...),
+    language: str = Form(...),
     model = Depends(get_genai_client)
 ):
     """Ask a question about the uploaded data and get a pandas code snippet as answer"""
@@ -201,22 +205,33 @@ async def ask_question(
         "converted_to_csv": file_info.get("converted_to_csv", False)
     }
     
+    original_question = question
+    
+    # Check if translation is needed
+    needs_translation = language.lower() != "en-us"
+    
+    if needs_translation:
+        # Translate question from user's language to English
+        translation_prompt = f"Translate the following text from {language} to English. Return ONLY the translated text with no additional explanations: {question}"
+        
+        try:
+            translation_response = model.generate_content(translation_prompt, generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 1024,
+            })
+            
+            # Use the translated question for processing
+            question = translation_response.text.strip()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+    
     # Construct initial prompt for Gemini
-    prompt = f"""
-    I have a pandas DataFrame with the following structure:
-    
-    Columns: {df_info['columns']}
-    Data types: {df_info['dtypes']}
-    
-    Here are the first few rows:
-    {df.head(5).fillna('NaN').to_string()}
-    
-    Question: {question}
-    
-    Please generate ONLY valid Python code using pandas to answer this question.
-    Only include the code needed to perform the requested operations on a DataFrame called 'df'.
-    Do not include explanations, print statements, or any non-code content.
-    """
+    prompt = PANDAS_PROMPT.format(
+        columns=df_info['columns'],
+        dtypes=df_info['dtypes'],
+        sample_data=df.head(5).fillna('NaN').to_string(),
+        question=question
+    )
     
     try:
         # Generate response
@@ -241,9 +256,15 @@ async def ask_question(
             
         # Validate the generated code
         if not validate_code(code):
+            error_message = "Generated code contains potentially unsafe operations."
+            if needs_translation:
+                error_translation_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {error_message}"
+                error_translation = model.generate_content(error_translation_prompt, generation_config={"temperature": 0.1})
+                error_message = error_translation.text.strip()
+            
             return JSONResponse(
                 status_code=400,
-                content={"error": "Generated code contains potentially unsafe operations."}
+                content={"error": error_message}
             )
             
         # Create a local copy of the variables to use in exec
@@ -285,6 +306,35 @@ async def ask_question(
                     result_json = str(result)
                 result_type = type(result).__name__
                 
+            # If translation is needed, translate code comments
+            if needs_translation:
+                # Extract comments from the code
+                comment_pattern = r"#(.+?)(?=\n|$)"
+                comments = re.findall(comment_pattern, code)
+                
+                if comments:
+                    comments_text = "\n".join(comments)
+                    translation_prompt = f"Translate the following Python code comments from English to {language}. Return ONLY the translated comments, one per line, with no additional explanations:\n\n{comments_text}"
+                    
+                    try:
+                        translation_response = model.generate_content(translation_prompt, generation_config={
+                            "temperature": 0.1,
+                            "max_output_tokens": 2048,
+                        })
+                        
+                        translated_comments = translation_response.text.strip().split("\n")
+                        
+                        # Replace comments in the code
+                        for i, original_comment in enumerate(comments):
+                            if i < len(translated_comments):
+                                code = code.replace(
+                                    f"#{original_comment}", 
+                                    f"#{translated_comments[i]}"
+                                )
+                    except Exception as e:
+                        # If translation fails, keep original comments
+                        pass
+            
             response_data = {
                 "code": code,
                 "result": result_json,
@@ -301,29 +351,13 @@ async def ask_question(
         except Exception as e:
             # When execution error occurs, send error back to Gemini to fix it
             error_str = str(e)
-            fix_prompt = f"""
-            You are an expert pandas developer tasked with fixing broken data analysis code.
-
-            Question from user: {question}
-
-            DataFrame structure:
-            Columns: {df_info['columns']}
-
-            First few rows of data:
-            {df.head(5).fillna('NaN').to_string()}
-
-            The following code was generated but produced an error:
-            ```python
-            {code}
-            ```
-
-            Error message: "{error_str}"
-
-            Your task: Fix this code to correctly answer the user's question.
-            Focus on addressing the specific error while ensuring the code properly handles the data structure.
-            Examine the column names carefully and make sure they match the actual DataFrame.
-            Return ONLY the corrected Python code without any explanations or markdown formatting.
-            """
+            fix_prompt = FIX_CODE_PROMPT.format(
+                question=question,
+                columns=df_info['columns'],
+                sample_data=df.head(5).fillna('NaN').to_string(),
+                code=code,
+                error_str=error_str
+            )
             
             try:
                 # Generate fixed code
@@ -347,11 +381,28 @@ async def ask_question(
                 
                 # Validate the fixed code
                 if not validate_code(fixed_code):
+                    error_message = "Generated code contains potentially unsafe operations."
+                    original_error = error_str
+                    
+                    if needs_translation:
+                        error_translation_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {error_message}"
+                        original_error_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {original_error}"
+                        
+                        try:
+                            error_translation = model.generate_content(error_translation_prompt, generation_config={"temperature": 0.1})
+                            original_error_translation = model.generate_content(original_error_prompt, generation_config={"temperature": 0.1})
+                            
+                            error_message = error_translation.text.strip()
+                            original_error = original_error_translation.text.strip()
+                        except Exception:
+                            # If translation fails, use original error messages
+                            pass
+                    
                     return JSONResponse(
                         status_code=400,
                         content={
-                            "error": "Generated code contains potentially unsafe operations.",
-                            "original_error": error_str,
+                            "error": error_message,
+                            "original_error": original_error,
                             "original_code": code,
                             "fixed_code": fixed_code
                         }
@@ -388,6 +439,46 @@ async def ask_question(
                         result_json = str(result)
                     result_type = type(result).__name__
                 
+                # Translate fixed code comments if needed
+                if needs_translation:
+                    # Extract comments from the fixed code
+                    comment_pattern = r"#(.+?)(?=\n|$)"
+                    comments = re.findall(comment_pattern, fixed_code)
+                    
+                    if comments:
+                        comments_text = "\n".join(comments)
+                        translation_prompt = f"Translate the following Python code comments from English to {language}. Return ONLY the translated comments, one per line, with no additional explanations:\n\n{comments_text}"
+                        
+                        try:
+                            translation_response = model.generate_content(translation_prompt, generation_config={
+                                "temperature": 0.1,
+                                "max_output_tokens": 2048,
+                            })
+                            
+                            translated_comments = translation_response.text.strip().split("\n")
+                            
+                            # Replace comments in the code
+                            for i, original_comment in enumerate(comments):
+                                if i < len(translated_comments):
+                                    fixed_code = fixed_code.replace(
+                                        f"#{original_comment}", 
+                                        f"#{translated_comments[i]}"
+                                    )
+                        except Exception:
+                            # If translation fails, keep original comments
+                            pass
+                
+                # Translate error message if needed
+                original_error = error_str
+                if needs_translation:
+                    error_translation_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {error_str}"
+                    try:
+                        error_translation = model.generate_content(error_translation_prompt, generation_config={"temperature": 0.1})
+                        original_error = error_translation.text.strip()
+                    except Exception:
+                        # If translation fails, use original error message
+                        pass
+                
                 # Return the fixed code and result
                 response_data = {
                     "code": fixed_code,
@@ -398,24 +489,55 @@ async def ask_question(
                         "converted_from_excel": file_info.get("converted_to_csv", False)
                     },
                     "error_fixed": True,
-                    "original_error": error_str
+                    "original_error": original_error
                 }
                 
                 return JSONResponse(content=response_data, media_type="application/json")
                 
             except Exception as fix_error:
                 # If fixing also fails, return both the original error and the fixing error
+                original_error = error_str
+                fixing_error = str(fix_error)
+                
+                if needs_translation:
+                    original_error_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {error_str}"
+                    fixing_error_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {fixing_error}"
+                    
+                    try:
+                        original_error_translation = model.generate_content(original_error_prompt, generation_config={"temperature": 0.1})
+                        fixing_error_translation = model.generate_content(fixing_error_prompt, generation_config={"temperature": 0.1})
+                        
+                        original_error = original_error_translation.text.strip()
+                        fixing_error = fixing_error_translation.text.strip()
+                    except Exception:
+                        # If translation fails, use original error messages
+                        pass
+                
+                error_message = f"Original error: {original_error}\nError fixing code: {fixing_error}"
+                
                 return JSONResponse(
                     status_code=400,
                     content={
-                        "error": f"Original error: {error_str}\nError fixing code: {str(fix_error)}",
+                        "error": error_message,
                         "original_code": code,
                         "fixing_attempt_failed": True
                     }
                 )
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating or executing code: {str(e)}")
+        error_message = f"Error generating or executing code: {str(e)}"
+        
+        if needs_translation:
+            translation_prompt = f"Translate the following text from English to {language}. Return ONLY the translated text with no additional explanations: {error_message}"
+            
+            try:
+                translation_response = model.generate_content(translation_prompt, generation_config={"temperature": 0.1})
+                error_message = translation_response.text.strip()
+            except Exception:
+                # If translation fails, use original error message
+                pass
+        
+        raise HTTPException(status_code=500, detail=error_message)
     
 @app.post("/summarize")
 async def summarize_data(request: Request):
@@ -426,7 +548,7 @@ async def summarize_data(request: Request):
         # Extract user question and data from the request
         user_question = data.get("question", "")
         input_data = data.get("data", {})
-        
+        language = data.get("language", "")
         # Handle empty data
         if not input_data:
             raise HTTPException(status_code=400, detail="No data provided for summarization")
@@ -435,17 +557,14 @@ async def summarize_data(request: Request):
         data_str = json.dumps(input_data, cls=NpEncoder, indent=2)
         
         # Get Gemini client
-        model = get_genai_client_thinking_model()
+        model = get_genai_client()
         
         # Create a combined prompt without using system role
-        prompt = f"""You are a data analysis assistant. Provide a concise summary of the data and actionable insights. Focus on key trends, outliers, and any important information.
-
-Question: {user_question}
-
-Data:
-{data_str}
-
-Please analyze this data and provide insights related to the question."""
+        prompt = SUMMARY_PROMPT.format(
+            question=user_question,
+            language=language,
+            data=data_str
+        )
         
         # Call the Gemini model with the combined prompt
         response = model.generate_content(prompt)
