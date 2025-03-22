@@ -72,13 +72,116 @@ def get_genai_client_thinkingmodel():
         raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
 
 # Helper function to sanitize data before JSON serialization
-def sanitize_for_json(obj):
-    """Convert data to JSON-safe format using the custom encoder"""
-    return json.loads(json.dumps(obj, cls=NpEncoder))
+def sanitize_for_json(data):
+    """Helper function to make data JSON serializable"""
+    if isinstance(data, dict):
+        return {k: sanitize_for_json(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_for_json(i) for i in data]
+    elif isinstance(data, (np.int64, np.int32)):
+        return int(data)
+    elif isinstance(data, (np.float64, np.float32)):
+        return float(data)
+    elif pd.isna(data):
+        return None
+    else:
+        return data
+
+async def generate_insights_from_gemini(df):
+    """Generate insights from Gemini based on the dataframe"""
+    # Configure the API key
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    
+    # Convert first 100 rows to CSV string format
+    data_sample = df.head(100)
+    csv_buffer = io.StringIO()
+    data_sample.to_csv(csv_buffer, index=False)
+    csv_text = csv_buffer.getvalue()
+    
+    # Set up the model
+    model = genai.GenerativeModel('gemini-2.0-flash')
+    
+    # Create the prompt with system instructions and example
+    system_instruction = "You're an expert data analyst, your task is to ask 4 insightful questions on this given piece of data to plot a visualisation out of this data:"
+    
+    example_response = """{
+  "question": [
+    "your question 1",
+    "your question 2",
+    "your question 3",
+    "your question 4"
+  ]
+}"""
+    
+    # The full prompt that includes the system instruction, example, and the actual data
+    prompt = f"{system_instruction}\n\nExample output format:\n{example_response}\n\nData to analyze:\n{csv_text}\n\nGenerate 4 insightful questions for this dataset"
+    
+    # Generate content with structured output
+    generation_config = {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "max_output_tokens": 8192,
+        "response_mime_type": "application/json"
+    }
+    
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        
+        # Parse the response
+        try:
+            # Check if response.text exists and contains valid JSON
+            if hasattr(response, 'text'):
+                return json.loads(response.text)
+            else:
+                # Alternative ways to get the response content if 'text' attribute doesn't exist
+                if hasattr(response, 'parts'):
+                    response_text = response.parts[0].text
+                    return json.loads(response_text)
+                elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+                    content = response.candidates[0].content
+                    if hasattr(content, 'parts') and len(content.parts) > 0:
+                        response_text = content.parts[0].text
+                        return json.loads(response_text)
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"Error parsing response: {str(e)}")
+            # If we can't parse JSON, try to extract text and format it
+            if hasattr(response, 'text'):
+                raw_text = response.text
+            elif hasattr(response, 'parts'):
+                raw_text = response.parts[0].text
+            else:
+                raw_text = str(response)
+                
+            # Try to format the raw text as JSON
+            try:
+                # Look for JSON-like content in the response
+                start_idx = raw_text.find("{")
+                end_idx = raw_text.rfind("}")
+                if start_idx >= 0 and end_idx > start_idx:
+                    json_str = raw_text[start_idx:end_idx+1]
+                    return json.loads(json_str)
+            except:
+                pass
+                
+            # If all else fails, create a simple structure with the raw text
+            return {"question": ["Could not parse response properly.", 
+                              "Please check the data format.",
+                              "Consider using a different prompt.",
+                              "Raw response may contain insights but in wrong format."]}
+    except Exception as e:
+        print(f"Error generating insights: {str(e)}")
+        return {"question": ["Could not generate insights from the data.",
+                          "Error connecting to Gemini API.",
+                          "Please check your API key and network connection.",
+                          "Try with a smaller dataset sample."]}
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), session_id: str = Form(...)):
-    """Upload Excel or CSV file, convert Excel to CSV if needed, and store as a pandas DataFrame"""
+    """Upload Excel or CSV file, convert Excel to CSV if needed, store as a pandas DataFrame and generate insights"""
     if file.filename.endswith(('.csv', '.xlsx', '.xls')):
         contents = await file.read()
         
@@ -133,10 +236,13 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
             # Get column information
             columns = df.columns.tolist()
             
-            # Get the first 10 rows
+            # Get the first 10 rows for preview
             sample_data = df.head(10).replace({np.nan: None})
             # Ensure all data is properly sanitized for JSON
             sample_data_dict = sanitize_for_json(sample_data.to_dict(orient='records'))
+            
+            # Generate insights using Gemini
+            insights = await generate_insights_from_gemini(df)
             
             conversion_message = ""
             if original_file_type == "excel":
@@ -152,6 +258,7 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
                 "first_10_rows": sample_data_dict,
                 "converted_to_csv": original_file_type == "excel",
                 "encoding_used": encoding_used,
+                "insights": insights,
                 "message": f"File uploaded successfully.{conversion_message} You can now ask questions about your data."
             }
             
@@ -161,6 +268,7 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
             raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
     else:
         raise HTTPException(status_code=400, detail="Only CSV and Excel files are supported")
+
 
 def validate_code(code: str) -> bool:
     """Validate if the code is safe to execute"""
