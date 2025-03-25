@@ -288,6 +288,87 @@ def validate_code(code: str) -> bool:
         return True
     except SyntaxError:
         return False
+async def add_color_suggestions(result_json, model):
+    """
+    Add color suggestions to the JSON result using Gemini Flash Lite
+    
+    Args:
+        result_json (list or dict): The original result to be color-coded
+        model: Gemini model client for generating color suggestions
+    
+    Returns:
+        list or dict: Result with added color suggestions
+    """
+    def generate_fallback_color(item):
+        """Generate a fallback color based on hash of item's string representation"""
+        # Use a string representation of the item to generate a unique color
+        item_str = str(item)
+        return f'#{hash(item_str) % 0xFFFFFF:06x}'
+
+    # Prepare prompt for color suggestion
+    color_prompt = f"""
+    Given this JSON data representing different entries and their values, 
+    suggest an appropriate hex color code for each entry that helps visualize 
+    the data effectively. The color should provide visual distinction and 
+    reflect the relative value of each category. Use a consistent color palette 
+    that is visually appealing and aids in data interpretation.
+
+    Input data:{result_json}
+
+    Output requirements:
+    1. Return a JSON with the original data plus a 'color' key for each entry
+    2. Use hex color codes ( ONLY light, pastel shades preferred)
+    3. Colors should help distinguish different entries
+    IMPORTANT: USE THE LIGHTEST SHADE OF COLORS. like sky blue type of shades
+    Ensure each entry gets a unique, visually appealing color.
+    """
+
+    try:
+        # Generate color suggestions
+        color_response = model.generate_content(color_prompt, generation_config={
+            "temperature": 0.2,
+            "max_output_tokens": 2048,
+        })
+
+        # Extract and parse the color-coded JSON
+        color_text = color_response.text.strip()
+        print(color_text, "---___COLOR")
+        
+        # Try to parse the response as JSON
+        try:
+            color_result = json.loads(color_text)
+            
+            # Validate and merge color suggestions
+            if isinstance(color_result, list):
+                # If result is a list, merge colors
+                updated_result = []
+                for i, item in enumerate(result_json):
+                    # Try to get color from color_result, fall back to generated color
+                    merged_item = item.copy()
+                    if i < len(color_result):
+                        color_suggestion = color_result[i].get('color', generate_fallback_color(item))
+                        merged_item['color'] = color_suggestion
+                    else:
+                        merged_item['color'] = generate_fallback_color(item)
+                    updated_result.append(merged_item)
+                return updated_result
+            
+            # If color_result is a dict, return it directly if it matches input structure
+            elif isinstance(color_result, dict):
+                return color_result
+        
+        except json.JSONDecodeError:
+            # Fallback to generating colors if JSON parsing fails
+            pass
+    
+    except Exception as e:
+        print(f"Color suggestion failed: {e}")
+    
+    # Final fallback: generate colors based on item hash
+    return [
+        {**item, 'color': generate_fallback_color(item)}
+        for item in result_json
+    ]
 
 @app.post("/ask")
 async def ask_question(
@@ -452,8 +533,19 @@ async def ask_question(
                     "converted_from_excel": file_info.get("converted_to_csv", False)
                 }
             }
+            if response_data.get('result') and isinstance(response_data['result'], list):
+                try:
+                    # Use a separate model instance for color suggestion if possible
+                    color_model = get_genai_client()  # or use a different method to get a Gemini Flash Lite client
+                    
+                    response_data['result'] = await add_color_suggestions(
+                        response_data['result'], 
+                        color_model
+                    )
+                except Exception as color_error:
+                    # Log the color suggestion error but don't block the main response
+                    print(f"Color suggestion failed: {color_error}")
             
-            # Use JSONResponse with custom encoder to handle any remaining edge cases
             return JSONResponse(content=response_data, media_type="application/json")
             
         except Exception as e:
