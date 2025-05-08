@@ -100,21 +100,31 @@ async def generate_insights_from_gemini(df):
     
     # Set up the model
     model = genai.GenerativeModel('gemini-2.0-flash')
+    columns = df.columns.tolist()
+    system_instruction = """You're an expert data analyst. Based on the provided dataset, generate 4 simple yet insightful questions that would be useful for business decisions. 
     
-    # Create the prompt with system instructions and example
-    system_instruction = "You're an expert data analyst, your task is to ask 4 insightful questions on this given piece of data to plot a visualisation out of this data:"
+        Focus on straightforward metrics like:
+        - Top/bottom performing products, categories, or regions
+        - Best/worst time periods for sales or engagement
+        - Clear trends or patterns in the data
+        - Basic comparisons between important segments
+
+        Your questions should be direct and actionable, focusing on business KPIs."""
     
     example_response = """{
   "question": [
-    "your question 1",
-    "your question 2",
-    "your question 3",
-    "your question 4"
+    "What are the top 5 selling products by quantity?",
+    "Which region generates the lowest revenue?", 
+    "What day of the week shows the highest customer engagement?",
+    "How do sales in Q1 compare to sales in Q4?"
   ]
 }"""
     
-    # The full prompt that includes the system instruction, example, and the actual data
-    prompt = f"{system_instruction}\n\nExample output format:\n{example_response}\n\nData to analyze:\n{csv_text}\n\nGenerate 4 insightful questions for this dataset"
+    # Include column information in the prompt
+    column_info = "Dataset columns: " + ", ".join(columns)
+    
+    # The full prompt
+    prompt = f"{system_instruction}\n\n{column_info}\n\nExample output format:\n{example_response}\n\nData to analyze:\n{csv_text}\n\nGenerate 4 simple, business-focused questions for this dataset."
     
     # Generate content with structured output
     generation_config = {
@@ -237,7 +247,7 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(...))
             columns = df.columns.tolist()
             
             # Get the first 10 rows for preview
-            sample_data = df.head(10).replace({np.nan: None})
+            sample_data = df.head(20).replace({np.nan: None})
             # Ensure all data is properly sanitized for JSON
             sample_data_dict = sanitize_for_json(sample_data.to_dict(orient='records'))
             
